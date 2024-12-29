@@ -5,12 +5,14 @@
 # This module is part of GitPython and is released under
 # the BSD License: https://opensource.org/license/bsd-3-clause/
 
+import contextlib
 from io import BytesIO
 import os
 from stat import S_ISLNK, ST_MODE
 import tempfile
 from unittest import skipIf
 import shutil
+import ddt
 
 from git import (
     IndexFile,
@@ -28,9 +30,9 @@ from git.exc import HookExecutionError, InvalidGitRepositoryError
 from git.index.fun import hook_path
 from git.index.typ import BaseIndexEntry, IndexEntry
 from git.objects import Blob
-from test.lib import TestBase, fixture_path, fixture, with_rw_repo
+from test.lib import TestBase, VirtualEnvironment, fixture_path, fixture, with_rw_repo
 from test.lib import with_rw_directory
-from git.util import Actor, rmtree
+from git.util import Actor, cwd, rmtree
 from git.util import HIDE_WINDOWS_KNOWN_ERRORS, hex_to_bin
 from gitdb.base import IStream
 
@@ -57,6 +59,7 @@ def _make_hook(git_dir, name, content, make_exec=True):
     return hp
 
 
+@ddt.ddt
 class TestIndex(TestBase):
     def __init__(self, *args):
         super(TestIndex, self).__init__(*args)
@@ -954,3 +957,44 @@ class TestIndex(TestBase):
         file.touch()
 
         rw_repo.index.add(file)
+
+    @ddt.data((False,), (True,))
+    @with_rw_directory
+    def test_hook_uses_shell_not_from_cwd(self, rw_dir, case):
+        (chdir_to_repo,) = case
+
+        shell_name = "bash.exe" if os.name == "nt" else "sh"
+        maybe_chdir = cwd(rw_dir) if chdir_to_repo else contextlib.nullcontext()
+        repo = Repo.init(rw_dir)
+
+        # We need an impostor shell that works on Windows and that the test can
+        # distinguish from the real bash.exe. But even if the real bash.exe is absent or
+        # unusable, we should verify the impostor is not run. So the impostor needs a
+        # clear side effect (unlike in TestGit.test_it_executes_git_not_from_cwd). Popen
+        # on Windows uses CreateProcessW, which disregards PATHEXT; the impostor may
+        # need to be a binary executable to ensure the vulnerability is found if
+        # present. No compiler need exist, shipping a binary in the test suite may
+        # target the wrong architecture, and generating one in a bespoke way may trigger
+        # false positive virus scans. So we use a Bash/Python polyglot for the hook and
+        # use the Python interpreter itself as the bash.exe impostor. But an interpreter
+        # from a venv may not run when copied outside of it, and a global interpreter
+        # won't run when copied to a different location if it was installed from the
+        # Microsoft Store. So we make a new venv in rw_dir and use its interpreter.
+        venv = VirtualEnvironment(rw_dir, with_pip=False)
+        shutil.copy(venv.python, Path(rw_dir, shell_name))
+        shutil.copy(fixture_path("polyglot"), hook_path("polyglot", repo.git_dir))
+        payload = Path(rw_dir, "payload.txt")
+
+        if type(_win_bash_status) in {WinBashStatus.Absent, WinBashStatus.WslNoDistro}:
+            # The real shell can't run, but the impostor should still not be used.
+            with self.assertRaises(HookExecutionError):
+                with maybe_chdir:
+                    run_commit_hook("polyglot", repo.index)
+            self.assertFalse(payload.exists())
+        else:
+            # The real shell should run, and not the impostor.
+            with maybe_chdir:
+                run_commit_hook("polyglot", repo.index)
+            self.assertFalse(payload.exists())
+            output = Path(rw_dir, "output.txt").read_text(encoding="utf-8")
+            self.assertEqual(output, "Ran intended hook.\n")
